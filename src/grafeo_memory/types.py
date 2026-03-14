@@ -51,7 +51,9 @@ class MemoryConfig:
     session_id: str | None = None
     agent_id: str | None = None
     run_id: str | None = None
-    similarity_threshold: float = 0.7
+    reconciliation_threshold: float = 0.3
+    search_min_score: float = 0.0
+    agreement_bonus: float = 0.1
     embedding_dimensions: int = 1536
     vector_property: str = "embedding"
     text_property: str = "text"
@@ -86,8 +88,12 @@ class MemoryConfig:
     def __post_init__(self) -> None:
         if self.embedding_dimensions <= 0:
             raise ValueError(f"embedding_dimensions must be positive, got {self.embedding_dimensions}")
-        if not (0.0 < self.similarity_threshold <= 1.0):
-            raise ValueError(f"similarity_threshold must be in (0.0, 1.0], got {self.similarity_threshold}")
+        if not (0.0 <= self.reconciliation_threshold <= 1.0):
+            raise ValueError(
+                f"reconciliation_threshold must be in [0.0, 1.0], got {self.reconciliation_threshold}"
+            )
+        if not (0.0 <= self.search_min_score <= 1.0):
+            raise ValueError(f"search_min_score must be in [0.0, 1.0], got {self.search_min_score}")
         if self.decay_rate <= 0:
             raise ValueError(f"decay_rate must be positive, got {self.decay_rate}")
 
@@ -100,6 +106,7 @@ class MemoryConfig:
             "topology_boost_factor",
             "structural_feedback_gamma",
             "consolidation_protect_threshold",
+            "agreement_bonus",
         ):
             val = getattr(self, name)
             if not (0.0 <= val <= 1.0):
@@ -168,6 +175,7 @@ class SearchResult:
     importance: float | None = None
     access_count: int | None = None
     memory_type: str | None = None
+    source: str | None = None
 
 
 @dataclass

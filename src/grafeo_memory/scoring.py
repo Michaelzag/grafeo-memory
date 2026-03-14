@@ -109,6 +109,7 @@ def apply_importance_scoring(
                 importance=importance,
                 access_count=access_count,
                 memory_type=r.memory_type,
+                source=r.source,
             )
         )
 
@@ -155,6 +156,7 @@ def apply_topology_boost(
                 importance=r.importance,
                 access_count=r.access_count,
                 memory_type=r.memory_type,
+                source=r.source,
             )
         )
 

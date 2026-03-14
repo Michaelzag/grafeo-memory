@@ -223,7 +223,7 @@ class _MemoryCore:
             self._db,
             embeddings,
             user_id=uid,
-            threshold=self._config.similarity_threshold,
+            threshold=self._config.reconciliation_threshold,
             vector_property=self._config.vector_property,
             filters=similar_filters,
         )
@@ -405,6 +405,7 @@ class _MemoryCore:
         filters: dict | None = None,
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
+        min_score: float | None = None,
         _trace: list[ExplainStep] | None = None,
     ) -> SearchResponse:
         on_usage, total = self._make_usage_collector()
@@ -492,12 +493,38 @@ class _MemoryCore:
                 )
             )
 
-        # Merge and deduplicate (keep highest score per memory)
-        all_results = vector_results + graph_results
+        # Merge and deduplicate with agreement bonus
+        vector_map = {r.memory_id: r for r in vector_results}
+        graph_map = {r.memory_id: r for r in graph_results}
+        all_ids = set(vector_map) | set(graph_map)
+        bonus = self._config.agreement_bonus
+        agreement_count = 0
         seen: dict[str, SearchResult] = {}
-        for r in all_results:
-            if r.memory_id not in seen or r.score > seen[r.memory_id].score:
-                seen[r.memory_id] = r
+        for mid in all_ids:
+            v = vector_map.get(mid)
+            g = graph_map.get(mid)
+            if v and g:
+                agreement_count += 1
+                best = v if v.score >= g.score else g
+                score = best.score * (1.0 + bonus)
+                seen[mid] = SearchResult(
+                    memory_id=best.memory_id,
+                    text=best.text,
+                    score=score,
+                    user_id=best.user_id,
+                    metadata=best.metadata,
+                    relations=best.relations,
+                    actor_id=best.actor_id,
+                    role=best.role,
+                    importance=best.importance,
+                    access_count=best.access_count,
+                    memory_type=best.memory_type,
+                    source="both",
+                )
+            elif v:
+                seen[mid] = v
+            else:
+                seen[mid] = g  # type: ignore[assignment]
 
         final = sorted(seen.values(), key=lambda r: r.score, reverse=True)
 
@@ -505,7 +532,12 @@ class _MemoryCore:
             _trace.append(
                 ExplainStep(
                     name="merge",
-                    detail={"before_dedup": len(all_results), "after_dedup": len(final)},
+                    detail={
+                        "vector_count": len(vector_results),
+                        "graph_count": len(graph_results),
+                        "after_dedup": len(final),
+                        "agreement_count": agreement_count,
+                    },
                 )
             )
 
@@ -531,6 +563,19 @@ class _MemoryCore:
             final = apply_importance_scoring(final, self._db, self._config)
             if _trace is not None:
                 _trace.append(ExplainStep(name="importance_scoring", detail={"applied": True}))
+
+        # Min-score filtering: drop results below threshold
+        effective_min = min_score if min_score is not None else self._config.search_min_score
+        if effective_min > 0:
+            before_filter = len(final)
+            final = [r for r in final if r.score >= effective_min]
+            if _trace is not None:
+                _trace.append(
+                    ExplainStep(
+                        name="min_score_filter",
+                        detail={"threshold": effective_min, "before": before_filter, "after": len(final)},
+                    )
+                )
 
         return SearchResponse(final[:k], usage=total)
 
@@ -765,6 +810,10 @@ class _MemoryCore:
         node_id = node.id if hasattr(node, "id") else node
 
         if embedding is not None:
+            if self._embedding_dims and len(embedding) != self._embedding_dims:
+                raise ValueError(
+                    f"Embedding dimension mismatch: got {len(embedding)}, expected {self._embedding_dims}"
+                )
             self._db.set_node_property(node_id, self._config.vector_property, embedding)
             self._ensure_vector_index()
 
@@ -1246,10 +1295,19 @@ class MemoryManager(_MemoryCore):
         filters: dict | None = None,
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
+        min_score: float | None = None,
     ) -> SearchResponse:
         """Search memories by semantic similarity and graph context."""
         return run_sync(
-            self._search(query, user_id=user_id, k=k, filters=filters, rerank=rerank, memory_type=memory_type)
+            self._search(
+                query,
+                user_id=user_id,
+                k=k,
+                filters=filters,
+                rerank=rerank,
+                memory_type=memory_type,
+                min_score=min_score,
+            )
         )
 
     def update(self, memory_id: str, text: str) -> MemoryEvent:
@@ -1395,6 +1453,7 @@ class AsyncMemoryManager(_MemoryCore):
         filters: dict | None = None,
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
+        min_score: float | None = None,
     ) -> SearchResponse:
         """Search memories by semantic similarity and graph context."""
         return await self._search(
@@ -1404,6 +1463,7 @@ class AsyncMemoryManager(_MemoryCore):
             filters=filters,
             rerank=rerank,
             memory_type=memory_type,
+            min_score=min_score,
         )
 
     async def update(self, memory_id: str, text: str) -> MemoryEvent:

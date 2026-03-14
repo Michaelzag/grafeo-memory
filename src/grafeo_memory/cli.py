@@ -38,6 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("query", help="Search query")
     p_search.add_argument("-k", type=int, default=10, help="Number of results (default: 10)")
     p_search.add_argument("--type", "-t", dest="memory_type", choices=["semantic", "procedural"])
+    p_search.add_argument("--min-score", type=float, default=None, help="Minimum score threshold (0.0-1.0)")
 
     # list
     p_list = sub.add_parser("list", help="List all memories")
@@ -183,7 +184,8 @@ def _cmd_add(manager, args: argparse.Namespace) -> None:
 
 
 def _cmd_search(manager, args: argparse.Namespace) -> None:
-    results = manager.search(args.query, k=args.k, memory_type=args.memory_type)
+    min_score = getattr(args, "min_score", None)
+    results = manager.search(args.query, k=args.k, memory_type=args.memory_type, min_score=min_score)
     _print_results(list(results), json_mode=args.output_json)
 
 
