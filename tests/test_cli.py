@@ -27,7 +27,7 @@ class FakeManager:
         self.calls.append(("add", text, memory_type, infer))
         return [MemoryEvent(action=MemoryAction.ADD, memory_id="1", text=text)]
 
-    def search(self, query, *, k=10, memory_type=None):
+    def search(self, query, *, k=10, memory_type=None, min_score=None):
         self.calls.append(("search", query, k, memory_type))
         return [SearchResult(memory_id="1", text="alice works at acme", score=0.95, user_id="u1")]
 

@@ -22,17 +22,31 @@ class TestMemoryConfigValidation:
         with pytest.raises(ValueError, match="embedding_dimensions must be positive"):
             MemoryConfig(embedding_dimensions=-1)
 
-    def test_similarity_threshold_zero(self):
-        with pytest.raises(ValueError, match="similarity_threshold must be in"):
-            MemoryConfig(similarity_threshold=0.0)
+    def test_reconciliation_threshold_negative(self):
+        with pytest.raises(ValueError, match="reconciliation_threshold must be in"):
+            MemoryConfig(reconciliation_threshold=-0.1)
 
-    def test_similarity_threshold_above_one(self):
-        with pytest.raises(ValueError, match="similarity_threshold must be in"):
-            MemoryConfig(similarity_threshold=1.1)
+    def test_reconciliation_threshold_above_one(self):
+        with pytest.raises(ValueError, match="reconciliation_threshold must be in"):
+            MemoryConfig(reconciliation_threshold=1.1)
 
-    def test_similarity_threshold_one_is_valid(self):
-        config = MemoryConfig(similarity_threshold=1.0)
-        assert config.similarity_threshold == 1.0
+    def test_reconciliation_threshold_boundaries_valid(self):
+        config = MemoryConfig(reconciliation_threshold=0.0)
+        assert config.reconciliation_threshold == 0.0
+        config = MemoryConfig(reconciliation_threshold=1.0)
+        assert config.reconciliation_threshold == 1.0
+
+    def test_search_min_score_negative(self):
+        with pytest.raises(ValueError, match="search_min_score must be in"):
+            MemoryConfig(search_min_score=-0.1)
+
+    def test_search_min_score_above_one(self):
+        with pytest.raises(ValueError, match="search_min_score must be in"):
+            MemoryConfig(search_min_score=1.1)
+
+    def test_search_min_score_default_zero(self):
+        config = MemoryConfig()
+        assert config.search_min_score == 0.0
 
     def test_decay_rate_zero(self):
         with pytest.raises(ValueError, match="decay_rate must be positive"):
@@ -53,6 +67,7 @@ class TestMemoryConfigValidation:
             "topology_boost_factor",
             "structural_feedback_gamma",
             "consolidation_protect_threshold",
+            "agreement_bonus",
         ],
     )
     def test_weight_negative(self, field_name):
@@ -70,6 +85,7 @@ class TestMemoryConfigValidation:
             "topology_boost_factor",
             "structural_feedback_gamma",
             "consolidation_protect_threshold",
+            "agreement_bonus",
         ],
     )
     def test_weight_above_one(self, field_name):
