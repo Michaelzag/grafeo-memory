@@ -817,9 +817,7 @@ class _MemoryCore:
 
         if embedding is not None:
             if self._embedding_dims and len(embedding) != self._embedding_dims:
-                raise ValueError(
-                    f"Embedding dimension mismatch: got {len(embedding)}, expected {self._embedding_dims}"
-                )
+                raise ValueError(f"Embedding dimension mismatch: got {len(embedding)}, expected {self._embedding_dims}")
             self._db.set_node_property(node_id, self._config.vector_property, embedding)
             self._ensure_vector_index()
 

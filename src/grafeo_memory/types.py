@@ -89,9 +89,7 @@ class MemoryConfig:
         if self.embedding_dimensions <= 0:
             raise ValueError(f"embedding_dimensions must be positive, got {self.embedding_dimensions}")
         if not (0.0 <= self.reconciliation_threshold <= 1.0):
-            raise ValueError(
-                f"reconciliation_threshold must be in [0.0, 1.0], got {self.reconciliation_threshold}"
-            )
+            raise ValueError(f"reconciliation_threshold must be in [0.0, 1.0], got {self.reconciliation_threshold}")
         if not (0.0 <= self.search_min_score <= 1.0):
             raise ValueError(f"search_min_score must be in [0.0, 1.0], got {self.search_min_score}")
         if self.decay_rate <= 0:

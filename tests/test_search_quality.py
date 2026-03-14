@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
+from mock_llm import MockEmbedder, make_test_model
 
 from grafeo_memory import AsyncMemoryManager, MemoryConfig, MemoryManager
-from mock_llm import MockEmbedder, make_test_model
 
 
 def _make_manager(outputs, dims=16, **config_kwargs):
@@ -157,11 +155,13 @@ class TestEmbeddingDimensionValidation:
                 # Return 8-dim vectors instead of 16
                 return [[0.1] * 8 for _ in texts]
 
-        model = make_test_model([
-            {"facts": ["test fact"], "entities": [], "relations": []},
-            {"decisions": [{"action": "ADD", "text": "test fact", "target_memory_id": None}]},
-            {"delete": []},
-        ])
+        model = make_test_model(
+            [
+                {"facts": ["test fact"], "entities": [], "relations": []},
+                {"decisions": [{"action": "ADD", "text": "test fact", "target_memory_id": None}]},
+                {"delete": []},
+            ]
+        )
         config = MemoryConfig(db_path=None, user_id="test_user", embedding_dimensions=16)
         mgr = MemoryManager(model, config, embedder=WrongDimEmbedder())
         with pytest.raises(ValueError, match="Embedding dimension mismatch"):
