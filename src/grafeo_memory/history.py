@@ -21,11 +21,17 @@ class HistoryEntry:
     role: str | None = None
 
 
-def record_history(db: object, memory_node_id: int, entry: HistoryEntry) -> int:
-    """Create a History node and link it to the memory via HAS_HISTORY edge.
+def record_history(db: object, memory_node_id: int, entry: HistoryEntry) -> int | None:
+    """Record a history entry.
 
-    Returns the node ID of the new History node.
+    With native CDC, this is a no-op (the engine tracks changes automatically).
+    Returns the node ID of the new History node, or None when CDC handles it.
     """
+    if hasattr(db, "node_history"):
+        # Native CDC available: engine tracks changes automatically
+        return None
+
+    # Fallback: create History node (legacy behavior)
     props: dict = {
         "event": entry.event,
         "timestamp": entry.timestamp,
@@ -46,7 +52,51 @@ def record_history(db: object, memory_node_id: int, entry: HistoryEntry) -> int:
 
 
 def get_history(db: object, memory_node_id: int) -> list[HistoryEntry]:
-    """Retrieve all history entries for a memory, ordered by timestamp ascending."""
+    """Retrieve history. Prefers native CDC when available."""
+    if hasattr(db, "node_history"):
+        try:
+            events = db.node_history(memory_node_id)
+            entries: list[HistoryEntry] = []
+            for ev in events:
+                kind = (ev.get("kind") or "UNKNOWN").upper()
+                before = ev.get("before") or {}
+                after = ev.get("after") or {}
+                ts = ev.get("timestamp", 0)
+
+                if "CREATE" in kind:
+                    entries.append(
+                        HistoryEntry(
+                            event="ADD",
+                            new_text=after.get("text"),
+                            timestamp=ts,
+                        )
+                    )
+                elif "DELETE" in kind:
+                    entries.append(
+                        HistoryEntry(
+                            event="DELETE",
+                            old_text=before.get("text"),
+                            timestamp=ts,
+                        )
+                    )
+                elif "UPDATE" in kind or "SET" in kind:
+                    old_text = before.get("text")
+                    new_text = after.get("text")
+                    # Only include if the text property actually changed
+                    if old_text != new_text and (old_text is not None or new_text is not None):
+                        entries.append(
+                            HistoryEntry(
+                                event="UPDATE",
+                                old_text=old_text,
+                                new_text=new_text,
+                                timestamp=ts,
+                            )
+                        )
+            return entries
+        except Exception:
+            pass  # Fall through to legacy
+
+    # Legacy: query History nodes
     try:
         query = (
             f"MATCH (m)-[:{HAS_HISTORY_EDGE}]->(h:{HISTORY_LABEL}) "
@@ -59,7 +109,9 @@ def get_history(db: object, memory_node_id: int) -> list[HistoryEntry]:
         import logging
 
         logging.getLogger(__name__).warning(
-            "get_history: query failed for memory node %s", memory_node_id, exc_info=True
+            "get_history: query failed for memory node %s",
+            memory_node_id,
+            exc_info=True,
         )
         return []
 

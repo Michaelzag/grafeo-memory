@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -19,8 +20,10 @@ from .types import (
     DERIVED_FROM_EDGE,
     ENTITY_LABEL,
     HAS_ENTITY_EDGE,
+    LEADS_TO_EDGE,
     MEMORY_LABEL,
     RELATION_EDGE,
+    SUPERSEDES_EDGE,
     AddResult,
     Entity,
     ExplainResult,
@@ -68,6 +71,7 @@ class _MemoryCore:
 
         self._vector_index_ready = False
         self._user_locks: dict[str, asyncio.Lock] = {}
+        self._graph_dirty = False
         self._ensure_indexes()
 
         # OpenTelemetry: instrument all pydantic-ai agents when enabled
@@ -100,6 +104,13 @@ class _MemoryCore:
             self._db.create_text_index(MEMORY_LABEL, tp)
         except Exception:
             logger.debug("Text index creation deferred or already exists")
+
+        # Property indexes for fast filtered lookups
+        for prop in ("user_id", "created_at", "memory_type"):
+            with contextlib.suppress(Exception):
+                self._db.create_property_index(prop)
+        with contextlib.suppress(Exception):
+            self._db.create_property_index("name")
 
     def _ensure_vector_index(self) -> None:
         """Lazily create the vector index after the first embedding is stored."""
@@ -186,19 +197,26 @@ class _MemoryCore:
             text = f"{text}\n{image_text}" if text else image_text
 
         if not infer:
-            return AddResult(
-                self._raw_add(
-                    text,
-                    uid,
-                    sid,
-                    metadata,
-                    now_ms,
-                    actor_id,
-                    role,
-                    importance=importance,
-                    memory_type=mtype,
-                )
+            events = self._raw_add(
+                text,
+                uid,
+                sid,
+                metadata,
+                now_ms,
+                actor_id,
+                role,
+                importance=importance,
+                memory_type=mtype,
             )
+            # LEADS_TO edges for raw adds
+            run = self._config.run_id or sid
+            if run:
+                new_ids = [e.memory_id for e in events if e.action == MemoryAction.ADD and e.memory_id]
+                if new_ids:
+                    self._link_session_chain(new_ids, uid, run)
+            if events:
+                self._graph_dirty = True
+            return AddResult(events)
 
         # Select prompt based on memory type
         custom_prompt = self._config.custom_fact_prompt
@@ -222,7 +240,9 @@ class _MemoryCore:
         # Scope reconciliation to same memory type (only for procedural — semantic skips for backward compat)
         similar_filters = {"memory_type": mtype.value} if mtype != MemoryType.SEMANTIC else None
 
-        # Lock per-user to prevent race conditions between search_similar and reconcile
+        # Per-user lock prevents race conditions where concurrent adds reconcile
+        # against the same existing memory. The LLM call (reconcile_async) happens
+        # inside the lock but outside any DB transaction.
         lock = self._user_locks.setdefault(uid, asyncio.Lock())
         async with lock:
             existing = search_similar(
@@ -237,6 +257,7 @@ class _MemoryCore:
 
             decisions = await reconcile_async(self._model, extraction.facts, existing, _on_usage=on_usage)
 
+            # Execute memory mutations inside a transaction for atomicity
             events = await self._execute_decisions(
                 decisions,
                 embeddings,
@@ -251,6 +272,17 @@ class _MemoryCore:
                 memory_type=mtype,
                 _on_usage=on_usage,
             )
+
+            # Create LEADS_TO edges for session ordering
+            run = self._config.run_id or sid
+            if run:
+                new_add_ids = [e.memory_id for e in events if e.action == MemoryAction.ADD and e.memory_id]
+                if new_add_ids:
+                    self._link_session_chain(new_add_ids, uid, run)
+
+            if events:
+                self._graph_dirty = True
+
         return AddResult(events, usage=total)
 
     async def _add_batch(
@@ -328,20 +360,63 @@ class _MemoryCore:
 
         embeddings = self._embedder.embed(texts)
 
-        events: list[MemoryEvent] = []
+        # Build property dicts for all nodes
+        mtype_val = memory_type.value if isinstance(memory_type, MemoryType) else memory_type
+        metadata_json = json.dumps(metadata) if metadata else None
+        properties_list: list[dict] = []
         for text, embedding, (actor_id, role) in zip(texts, embeddings, actors, strict=True):
-            memory_id = self._create_memory(
-                text,
-                embedding,
-                user_id,
-                session_id,
-                metadata,
-                timestamp,
-                actor_id,
-                role,
-                importance=importance,
-                memory_type=memory_type,
-            )
+            props: dict = {
+                "text": text,
+                "user_id": user_id,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "learned_at": timestamp,
+                "memory_type": mtype_val,
+            }
+            if session_id:
+                props["session_id"] = session_id
+            if metadata_json:
+                props["metadata"] = metadata_json
+            if self._config.agent_id:
+                props["agent_id"] = self._config.agent_id
+            if self._config.run_id:
+                props["run_id"] = self._config.run_id
+            if actor_id:
+                props["actor_id"] = actor_id
+            if role:
+                props["role"] = role
+            if self._config.enable_importance:
+                props["importance"] = importance
+                props["access_count"] = 0
+                props["last_accessed"] = timestamp
+            if embedding is not None:
+                if self._embedding_dims and len(embedding) != self._embedding_dims:
+                    raise ValueError(
+                        f"Embedding dimension mismatch: got {len(embedding)}, expected {self._embedding_dims}"
+                    )
+                props[self._config.vector_property] = embedding
+            properties_list.append(props)
+
+        # Try batch creation, fall back to individual nodes
+        try:
+            node_ids = self._db.batch_create_nodes_with_props(MEMORY_LABEL, properties_list)
+        except AttributeError:
+            # batch_create_nodes_with_props not available, fall back to per-node creation
+            node_ids = []
+            for props in properties_list:
+                embedding = props.pop(self._config.vector_property, None)
+                node = self._db.create_node([MEMORY_LABEL], props)
+                nid = node.id if hasattr(node, "id") else node
+                if embedding is not None:
+                    self._db.set_node_property(nid, self._config.vector_property, embedding)
+                node_ids.append(nid)
+
+        self._ensure_vector_index()
+
+        # Record history and build events
+        events: list[MemoryEvent] = []
+        for nid, text, (actor_id, role) in zip(node_ids, texts, actors, strict=True):
+            memory_id = str(nid)
             record_history(
                 self._db,
                 int(memory_id),
@@ -412,8 +487,16 @@ class _MemoryCore:
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
         min_score: float | None = None,
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
         _trace: list[ExplainStep] | None = None,
     ) -> SearchResponse:
+        from .temporal import detect_temporal_hints
+
+        self._recompute_graph_metrics()
+
         on_usage, total = self._make_usage_collector()
         uid = user_id or self._config.user_id
         search_filters = self._build_filters(uid, filters)
@@ -422,23 +505,47 @@ class _MemoryCore:
             mtype = MemoryType(memory_type) if isinstance(memory_type, str) else memory_type
             search_filters["memory_type"] = mtype.value
 
+        # Detect temporal signals in the query and adjust search behavior
+        temporal_hints = detect_temporal_hints(query)
+        if temporal_hints.include_expired and not include_expired:
+            include_expired = True
+        effective_k = k * 2 if temporal_hints.expand_limit else k
+
         # Embed query once, share across both search paths
         query_embedding = self._embedder.embed([query])[0]
 
         if _trace is not None:
-            _trace.append(ExplainStep(name="embed_query", detail={"dimensions": len(query_embedding)}))
+            detail: dict = {"dimensions": len(query_embedding)}
+            if temporal_hints.is_temporal:
+                detail["temporal_hints"] = temporal_hints.signals
+            _trace.append(ExplainStep(name="embed_query", detail=detail))
 
-        vector_results = hybrid_search(
-            self._db,
-            self._embedder,
-            query,
-            user_id=uid,
-            k=k,
-            filters=search_filters,
-            vector_property=self._config.vector_property,
-            text_property=self._config.text_property,
-            query_embedding=query_embedding,
-        )
+        if diverse:
+            from .search.vector import diverse_search
+
+            vector_results = diverse_search(
+                self._db,
+                self._embedder,
+                query,
+                user_id=uid,
+                k=effective_k,
+                filters=search_filters,
+                vector_property=self._config.vector_property,
+                query_embedding=query_embedding,
+                lambda_mult=self._config.mmr_lambda,
+            )
+        else:
+            vector_results = hybrid_search(
+                self._db,
+                self._embedder,
+                query,
+                user_id=uid,
+                k=effective_k,
+                filters=search_filters,
+                vector_property=self._config.vector_property,
+                text_property=self._config.text_property,
+                query_embedding=query_embedding,
+            )
 
         if _trace is not None:
             _trace.append(
@@ -476,11 +583,12 @@ class _MemoryCore:
             query,
             user_id=uid,
             embedder=self._embedder,
-            k=k,
+            k=effective_k,
             vector_property=self._config.vector_property,
             _on_usage=on_usage,
             _entities=entities,
             query_embedding=query_embedding,
+            search_depth=self._config.graph_search_depth,
         )
 
         # Post-hoc filter graph results by memory_type if specified
@@ -547,6 +655,26 @@ class _MemoryCore:
                 )
             )
 
+        # Temporal filtering: exclude expired and apply time range
+        if not include_expired:
+            final = [r for r in final if r.expired_at is None]
+        if time_after is not None:
+            final = [r for r in final if r.created_at is not None and r.created_at >= time_after]
+        if time_before is not None:
+            final = [r for r in final if r.created_at is not None and r.created_at <= time_before]
+        if (time_after is not None or time_before is not None or include_expired) and _trace is not None:
+            _trace.append(
+                ExplainStep(
+                    name="temporal_filter",
+                    detail={
+                        "time_after": time_after,
+                        "time_before": time_before,
+                        "include_expired": include_expired,
+                        "remaining": len(final),
+                    },
+                )
+            )
+
         # Topology boost: lightweight structural re-ranking (no LLM call)
         if self._config.enable_topology_boost:
             from .scoring import apply_topology_boost
@@ -554,6 +682,14 @@ class _MemoryCore:
             final = apply_topology_boost(final, self._db, self._config)
             if _trace is not None:
                 _trace.append(ExplainStep(name="topology_boost", detail={"applied": True}))
+
+        # Cross-session boost: use cached graph algorithm scores
+        if self._config.cross_session_factor > 0:
+            from .scoring import apply_cross_session_boost
+
+            final = apply_cross_session_boost(final, self._db, self._config)
+            if _trace is not None:
+                _trace.append(ExplainStep(name="cross_session_boost", detail={"applied": True}))
 
         if rerank and self._reranker is not None:
             if hasattr(self._reranker, "rerank_async"):
@@ -583,6 +719,12 @@ class _MemoryCore:
                     )
                 )
 
+        # Temporal sort: when temporal keywords detected, sort chronologically instead of by score
+        if temporal_hints.sort_chronologically:
+            final.sort(key=lambda r: r.created_at or 0)
+            if _trace is not None:
+                _trace.append(ExplainStep(name="temporal_sort", detail={"order": "chronological"}))
+
         return SearchResponse(final[:k], usage=total)
 
     async def _explain(
@@ -592,10 +734,24 @@ class _MemoryCore:
         k: int = 10,
         *,
         memory_type: MemoryType | str | None = None,
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
     ) -> ExplainResult:
         """Run a search with full pipeline tracing."""
         trace: list[ExplainStep] = []
-        response = await self._search(query, user_id=user_id, k=k, memory_type=memory_type, _trace=trace)
+        response = await self._search(
+            query,
+            user_id=user_id,
+            k=k,
+            memory_type=memory_type,
+            time_before=time_before,
+            time_after=time_after,
+            include_expired=include_expired,
+            diverse=diverse,
+            _trace=trace,
+        )
 
         trace.append(
             ExplainStep(
@@ -714,10 +870,33 @@ class _MemoryCore:
                 )
 
             elif decision.action == MemoryAction.UPDATE and decision.target_memory_id:
-                old_text = self._update_memory(decision.target_memory_id, decision.text, timestamp)
+                # Soft-expiry update: expire old memory, create new one, link with SUPERSEDES
+                old_text = self._expire_memory(decision.target_memory_id, timestamp)
+                emb = self._embedder.embed([decision.text])[0]
+                new_memory_id = self._create_memory(
+                    decision.text,
+                    emb,
+                    user_id,
+                    session_id,
+                    metadata,
+                    timestamp,
+                    actor_id,
+                    role,
+                    importance=importance,
+                    memory_type=memory_type,
+                )
+                try:
+                    self._db.create_edge(int(new_memory_id), int(decision.target_memory_id), SUPERSEDES_EDGE)
+                except Exception:
+                    logger.warning(
+                        "Failed to create SUPERSEDES edge %s->%s",
+                        new_memory_id,
+                        decision.target_memory_id,
+                        exc_info=True,
+                    )
                 record_history(
                     self._db,
-                    int(decision.target_memory_id),
+                    int(new_memory_id),
                     HistoryEntry(
                         event="UPDATE",
                         old_text=old_text,
@@ -730,7 +909,7 @@ class _MemoryCore:
                 events.append(
                     MemoryEvent(
                         action=MemoryAction.UPDATE,
-                        memory_id=decision.target_memory_id,
+                        memory_id=new_memory_id,
                         text=decision.text,
                         old_text=old_text,
                         actor_id=actor_id,
@@ -743,7 +922,7 @@ class _MemoryCore:
                 logger.warning("DELETE without target_memory_id, skipping: %r", decision.text)
 
             elif decision.action == MemoryAction.DELETE and decision.target_memory_id:
-                old_text = self._delete_memory(decision.target_memory_id)
+                old_text = self._expire_memory(decision.target_memory_id, timestamp)
                 record_history(
                     self._db,
                     int(decision.target_memory_id),
@@ -786,6 +965,7 @@ class _MemoryCore:
         role: str | None = None,
         importance: float = 1.0,
         memory_type: MemoryType | str = MemoryType.SEMANTIC,
+        learned_at: int | None = None,
     ) -> str:
         mtype_val = memory_type.value if isinstance(memory_type, MemoryType) else memory_type
         props: dict = {
@@ -793,6 +973,7 @@ class _MemoryCore:
             "user_id": user_id,
             "created_at": timestamp,
             "updated_at": timestamp,
+            "learned_at": learned_at or timestamp,
             "memory_type": mtype_val,
         }
         if session_id:
@@ -859,6 +1040,213 @@ class _MemoryCore:
 
         self._db.delete_node(node_id)
         return old_text
+
+    def _expire_memory(self, memory_id: str, timestamp: int) -> str | None:
+        """Soft-expire a memory by setting expired_at instead of deleting it."""
+        try:
+            node_id = int(memory_id)
+        except ValueError:
+            return None
+
+        node = self._db.get_node(node_id)
+        if node is None:
+            return None
+
+        props = _get_props(node)
+        old_text = props.get("text", "")
+
+        self._db.set_node_property(node_id, "expired_at", timestamp)
+        return old_text
+
+    def _link_session_chain(self, new_memory_ids: list[str], user_id: str, run_id: str) -> None:
+        """Create LEADS_TO edges linking new memories to the session's previous memory."""
+        # Find the most recent existing memory in this session (by created_at, excluding the new ones)
+        new_set = set(new_memory_ids)
+        try:
+            nodes = self._db.get_nodes_by_label(MEMORY_LABEL)
+        except Exception:
+            return
+
+        prev_id: str | None = None
+        prev_ts: int = 0
+        for node_id, props in nodes:
+            mid = str(node_id)
+            if mid in new_set:
+                continue
+            if props.get("user_id") != user_id:
+                continue
+            node_run = props.get("run_id") or props.get("session_id")
+            if node_run != run_id:
+                continue
+            if props.get("expired_at") is not None:
+                continue
+            ts = int(props.get("created_at", 0))
+            if ts > prev_ts:
+                prev_ts = ts
+                prev_id = mid
+
+        # Chain: prev → first new, then new[0] → new[1] → ...
+        ordered = new_memory_ids
+        if prev_id is not None:
+            try:
+                self._db.create_edge(int(prev_id), int(ordered[0]), LEADS_TO_EDGE, {"sequence": 0})
+            except Exception:
+                logger.debug("Failed to create LEADS_TO edge %s->%s", prev_id, ordered[0], exc_info=True)
+
+        for i in range(len(ordered) - 1):
+            try:
+                self._db.create_edge(int(ordered[i]), int(ordered[i + 1]), LEADS_TO_EDGE, {"sequence": i + 1})
+            except Exception:
+                logger.debug("Failed to create LEADS_TO edge %s->%s", ordered[i], ordered[i + 1], exc_info=True)
+
+    def temporal_chain(
+        self,
+        memory_id: str,
+        user_id: str | None = None,
+        direction: str = "forward",
+        max_depth: int = 5,
+    ) -> list:
+        """Follow LEADS_TO edges to build a temporal chain of memories.
+
+        Args:
+            memory_id: Starting memory node ID.
+            user_id: If provided, only include memories belonging to this user.
+            direction: "forward", "backward", or "both".
+            max_depth: Maximum number of hops to traverse.
+
+        Returns:
+            List of dicts with memory_id, text, created_at, session_id.
+        """
+        mid = int(memory_id)
+        user_filter = " AND rest.user_id = $uid" if user_id else ""
+        params: dict = {"mid": mid}
+        if user_id:
+            params["uid"] = user_id
+
+        results: list[dict] = []
+
+        if direction in ("forward", "both"):
+            query = (
+                f"MATCH (m)-[:LEADS_TO*1..{max_depth}]->(rest:Memory) "
+                f"WHERE id(m) = $mid{user_filter} "
+                f"RETURN id(rest), rest.text, rest.created_at, rest.session_id "
+                f"ORDER BY rest.created_at"
+            )
+            try:
+                rows = self._db.execute(query, params)
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    vals = list(row.values())
+                    if len(vals) < 4:
+                        continue
+                    results.append(
+                        {
+                            "memory_id": str(vals[0]),
+                            "text": vals[1],
+                            "created_at": vals[2],
+                            "session_id": vals[3],
+                        }
+                    )
+            except Exception:
+                logger.debug(
+                    "temporal_chain forward query failed for %s",
+                    memory_id,
+                    exc_info=True,
+                )
+
+        if direction in ("backward", "both"):
+            query = (
+                f"MATCH (rest:Memory)-[:LEADS_TO*1..{max_depth}]->(m) "
+                f"WHERE id(m) = $mid{user_filter} "
+                f"RETURN id(rest), rest.text, rest.created_at, rest.session_id "
+                f"ORDER BY rest.created_at"
+            )
+            try:
+                rows = self._db.execute(query, params)
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    vals = list(row.values())
+                    if len(vals) < 4:
+                        continue
+                    entry = {
+                        "memory_id": str(vals[0]),
+                        "text": vals[1],
+                        "created_at": vals[2],
+                        "session_id": vals[3],
+                    }
+                    # Avoid duplicates when direction is "both"
+                    if not any(r["memory_id"] == entry["memory_id"] for r in results):
+                        results.append(entry)
+            except Exception:
+                logger.debug(
+                    "temporal_chain backward query failed for %s",
+                    memory_id,
+                    exc_info=True,
+                )
+
+        # Sort merged results by created_at
+        if direction == "both":
+            results.sort(key=lambda r: r.get("created_at") or 0)
+
+        return results
+
+    def _group_results_by_session(
+        self,
+        results: list,
+    ) -> dict[str, list]:
+        """Group search results by session_id, chronological within each group."""
+        from collections import defaultdict
+
+        groups: dict[str, list] = defaultdict(list)
+        for r in results:
+            groups[getattr(r, "session_id", None) or "default"].append(r)
+        for sid in groups:
+            groups[sid].sort(key=lambda r: getattr(r, "created_at", 0) or 0)
+        return dict(groups)
+
+    def _recompute_graph_metrics(self) -> None:
+        """Recompute graph algorithm scores and cache as node properties.
+
+        Runs pagerank, betweenness centrality, and louvain community detection.
+        Results are stored as node properties for fast access during search scoring.
+        Only runs when enable_graph_algorithms is True and the graph has changed.
+        """
+        if not self._config.enable_graph_algorithms or not self._graph_dirty:
+            return
+        self._graph_dirty = False
+
+        if not hasattr(self._db, "algorithms"):
+            logger.debug("Graph algorithms not available on this db instance")
+            return
+
+        algos = self._db.algorithms
+
+        try:
+            ranks = algos.pagerank(0.85, 100, 1e-6)
+            for node_id, score in ranks.items():
+                with contextlib.suppress(Exception):
+                    self._db.set_node_property(node_id, "_pagerank", score)
+        except Exception:
+            logger.debug("pagerank computation failed", exc_info=True)
+
+        try:
+            centrality = algos.betweenness_centrality(True)
+            for node_id, score in centrality.items():
+                with contextlib.suppress(Exception):
+                    self._db.set_node_property(node_id, "_betweenness", score)
+        except Exception:
+            logger.debug("betweenness_centrality computation failed", exc_info=True)
+
+        try:
+            result = algos.louvain(1.0)
+            communities = result.get("communities", {}) if isinstance(result, dict) else {}
+            for node_id, community_id in communities.items():
+                with contextlib.suppress(Exception):
+                    self._db.set_node_property(node_id, "_community", community_id)
+        except Exception:
+            logger.debug("louvain community detection failed", exc_info=True)
 
     async def _store_graph(
         self,
@@ -979,7 +1367,10 @@ class _MemoryCore:
                     break
 
     def _get_all_impl(
-        self, user_id: str | None = None, memory_type: MemoryType | str | None = None
+        self,
+        user_id: str | None = None,
+        memory_type: MemoryType | str | None = None,
+        include_expired: bool = False,
     ) -> list[SearchResult]:
         """Shared get_all implementation."""
         uid = user_id or self._config.user_id
@@ -994,6 +1385,9 @@ class _MemoryCore:
         for node_id, props in nodes:
             # Apply all scope filters
             if not all(props.get(k) == v for k, v in filters.items()):
+                continue
+            # Exclude expired unless explicitly requested
+            if not include_expired and props.get("expired_at") is not None:
                 continue
             # Filter by memory_type if specified (treat missing as "semantic")
             if memory_type is not None:
@@ -1011,12 +1405,14 @@ class _MemoryCore:
                     actor_id=props.get("actor_id"),
                     role=props.get("role"),
                     memory_type=props.get("memory_type", "semantic"),
+                    created_at=props.get("created_at"),
+                    expired_at=props.get("expired_at"),
                 )
             )
         return memories
 
     def _get_memories_with_timestamps(self, user_id: str) -> list[tuple[str, str, int]]:
-        """Get all memories as (memory_id, text, created_at) sorted oldest-first."""
+        """Get all active (non-expired) memories as (memory_id, text, created_at) sorted oldest-first."""
         try:
             nodes = self._db.get_nodes_by_label(MEMORY_LABEL)
         except Exception:
@@ -1026,6 +1422,8 @@ class _MemoryCore:
         results: list[tuple[str, str, int]] = []
         for node_id, props in nodes:
             if not all(props.get(k) == v for k, v in filters.items()):
+                continue
+            if props.get("expired_at") is not None:
                 continue
             results.append((str(node_id), props.get("text", ""), int(props.get("created_at", 0))))
 
@@ -1300,9 +1698,14 @@ class MemoryManager(_MemoryCore):
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
         min_score: float | None = None,
-    ) -> SearchResponse:
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
+        grouped: bool = False,
+    ) -> SearchResponse | dict[str, list]:
         """Search memories by semantic similarity and graph context."""
-        return run_sync(
+        response = run_sync(
             self._search(
                 query,
                 user_id=user_id,
@@ -1311,16 +1714,28 @@ class MemoryManager(_MemoryCore):
                 rerank=rerank,
                 memory_type=memory_type,
                 min_score=min_score,
+                time_before=time_before,
+                time_after=time_after,
+                include_expired=include_expired,
+                diverse=diverse,
             )
         )
+        if grouped:
+            return self._group_results_by_session(response)
+        return response
 
     def update(self, memory_id: str, text: str) -> MemoryEvent:
         """Update a memory's text directly. Re-embeds and records history."""
         return run_sync(self._update(memory_id, text))
 
-    def get_all(self, user_id: str | None = None, memory_type: MemoryType | str | None = None) -> list[SearchResult]:
+    def get_all(
+        self,
+        user_id: str | None = None,
+        memory_type: MemoryType | str | None = None,
+        include_expired: bool = False,
+    ) -> list[SearchResult]:
         """Retrieve all memories for a user."""
-        return self._get_all_impl(user_id, memory_type=memory_type)
+        return self._get_all_impl(user_id, memory_type=memory_type, include_expired=include_expired)
 
     def delete(self, memory_id: str) -> bool:
         """Delete a specific memory by its ID."""
@@ -1366,6 +1781,21 @@ class MemoryManager(_MemoryCore):
         """Get the change history for a memory."""
         return self._history_impl(memory_id)
 
+    def temporal_chain(
+        self,
+        memory_id: str,
+        user_id: str | None = None,
+        direction: str = "forward",
+        max_depth: int = 5,
+    ) -> list:
+        """Follow LEADS_TO edges to build a temporal chain of memories."""
+        return super().temporal_chain(
+            memory_id,
+            user_id=user_id,
+            direction=direction,
+            max_depth=max_depth,
+        )
+
     def stats(self) -> MemoryStats:
         """Return database introspection statistics (no LLM calls)."""
         return self._stats_impl()
@@ -1377,9 +1807,24 @@ class MemoryManager(_MemoryCore):
         k: int = 10,
         *,
         memory_type: MemoryType | str | None = None,
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
     ) -> ExplainResult:
         """Run a search and return a step-by-step pipeline trace."""
-        return run_sync(self._explain(query, user_id=user_id, k=k, memory_type=memory_type))
+        return run_sync(
+            self._explain(
+                query,
+                user_id=user_id,
+                k=k,
+                memory_type=memory_type,
+                time_before=time_before,
+                time_after=time_after,
+                include_expired=include_expired,
+                diverse=diverse,
+            )
+        )
 
 
 class AsyncMemoryManager(_MemoryCore):
@@ -1458,9 +1903,14 @@ class AsyncMemoryManager(_MemoryCore):
         rerank: bool = True,
         memory_type: MemoryType | str | None = None,
         min_score: float | None = None,
-    ) -> SearchResponse:
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
+        grouped: bool = False,
+    ) -> SearchResponse | dict[str, list]:
         """Search memories by semantic similarity and graph context."""
-        return await self._search(
+        response = await self._search(
             query,
             user_id=user_id,
             k=k,
@@ -1468,17 +1918,27 @@ class AsyncMemoryManager(_MemoryCore):
             rerank=rerank,
             memory_type=memory_type,
             min_score=min_score,
+            time_before=time_before,
+            time_after=time_after,
+            include_expired=include_expired,
+            diverse=diverse,
         )
+        if grouped:
+            return self._group_results_by_session(response)
+        return response
 
     async def update(self, memory_id: str, text: str) -> MemoryEvent:
         """Update a memory's text directly. Re-embeds and records history."""
         return await self._update(memory_id, text)
 
     async def get_all(
-        self, user_id: str | None = None, memory_type: MemoryType | str | None = None
+        self,
+        user_id: str | None = None,
+        memory_type: MemoryType | str | None = None,
+        include_expired: bool = False,
     ) -> list[SearchResult]:
         """Retrieve all memories for a user."""
-        return self._get_all_impl(user_id, memory_type=memory_type)
+        return self._get_all_impl(user_id, memory_type=memory_type, include_expired=include_expired)
 
     async def delete(self, memory_id: str) -> bool:
         """Delete a specific memory by its ID."""
@@ -1515,6 +1975,21 @@ class AsyncMemoryManager(_MemoryCore):
         """Get the change history for a memory."""
         return self._history_impl(memory_id)
 
+    async def temporal_chain(
+        self,
+        memory_id: str,
+        user_id: str | None = None,
+        direction: str = "forward",
+        max_depth: int = 5,
+    ) -> list:
+        """Follow LEADS_TO edges to build a temporal chain of memories."""
+        return super().temporal_chain(
+            memory_id,
+            user_id=user_id,
+            direction=direction,
+            max_depth=max_depth,
+        )
+
     def stats(self) -> MemoryStats:
         """Return database introspection statistics (no LLM calls)."""
         return self._stats_impl()
@@ -1526,6 +2001,19 @@ class AsyncMemoryManager(_MemoryCore):
         k: int = 10,
         *,
         memory_type: MemoryType | str | None = None,
+        time_before: int | None = None,
+        time_after: int | None = None,
+        include_expired: bool = False,
+        diverse: bool = False,
     ) -> ExplainResult:
         """Run a search and return a step-by-step pipeline trace."""
-        return await self._explain(query, user_id=user_id, k=k, memory_type=memory_type)
+        return await self._explain(
+            query,
+            user_id=user_id,
+            k=k,
+            memory_type=memory_type,
+            time_before=time_before,
+            time_after=time_after,
+            include_expired=include_expired,
+            diverse=diverse,
+        )
