@@ -14,7 +14,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "grafeo>=0.5.1",
+    "grafeo>=0.5",
     "pydantic-ai-slim",
 ]
 
@@ -95,6 +95,6 @@ dev-dependencies = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.15",
-    "ty>=0.0.16",
+    "ty>=0.0.26",
 ]
 
