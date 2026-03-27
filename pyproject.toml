@@ -1,6 +1,6 @@
 [project]
 name = "grafeo-memory"
-version = "0.1.5"
+version = "0.2.0"
 description = "AI memory layer powered by GrafeoDB's hybrid graph and vector database"
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "grafeo>=0.5.1",
+    "grafeo>=0.5.27",
     "pydantic-ai-slim",
 ]
 
@@ -54,11 +54,14 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 # ── Ty ────────────────────────────────────────────────────────────────
 [tool.ty.environment]
 python-version = "3.12"
-extra-paths = ["tests"]
+
+[tool.ty.src]
+# Tests use mocks/stubs that intentionally don't conform to production protocols.
+exclude = ["tests/"]
 
 # Downgrade rules that produce false positives from Rust-extension deps
-# without type stubs (grafeo), duck-typed `object` parameters, and
-# optional dependencies (openai, mistralai) not installed in CI.
+# without type stubs (grafeo), pydantic-ai Agent overloads, and optional
+# dependencies (openai, mistralai) not installed in CI.
 [tool.ty.rules]
 unresolved-import = "warn"
 unresolved-attribute = "warn"
@@ -92,6 +95,6 @@ dev-dependencies = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.15",
-    "ty>=0.0.16",
+    "ty>=0.0.26",
 ]
 

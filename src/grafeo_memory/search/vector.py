@@ -12,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..embedding import EmbeddingClient
+    from ..protocol import GrafeoDBProtocol
 
 
 def vector_search(
-    db: object,
+    db: GrafeoDBProtocol,
     embedder: EmbeddingClient,
     query: str,
     *,
@@ -49,6 +50,9 @@ def vector_search(
         if node is None:
             continue
         props = _get_props(node)
+        # Skip expired memories (soft-deleted)
+        if props.get("expired_at") is not None:
+            continue
         relations = _get_node_relations(db, node_id)
         similarity = max(0.0, 1.0 - float(distance))
         search_results.append(
@@ -61,6 +65,10 @@ def vector_search(
                 relations=relations if relations else None,
                 memory_type=props.get("memory_type", "semantic"),
                 source="vector",
+                created_at=props.get("created_at"),
+                learned_at=props.get("learned_at"),
+                session_id=props.get("session_id"),
+                expired_at=props.get("expired_at"),
             )
         )
 
@@ -68,7 +76,7 @@ def vector_search(
 
 
 def hybrid_search(
-    db: object,
+    db: GrafeoDBProtocol,
     embedder: EmbeddingClient,
     query: str,
     *,
@@ -110,7 +118,7 @@ def hybrid_search(
         all_filters.update(filters)
 
     try:
-        results = db.hybrid_search(
+        results = db.hybrid_search(  # ty: ignore[call-non-callable]
             MEMORY_LABEL,
             text_property,
             vector_property,
@@ -143,6 +151,9 @@ def hybrid_search(
         if node is None:
             continue
         props = _get_props(node)
+        # Skip expired memories (soft-deleted)
+        if props.get("expired_at") is not None:
+            continue
         # Apply all scope filters post-hoc (supports operator-based filters)
         if not _matches_filters(props, all_filters):
             continue
@@ -165,6 +176,10 @@ def hybrid_search(
                 role=props.get("role"),
                 memory_type=props.get("memory_type", "semantic"),
                 source="vector",
+                created_at=props.get("created_at"),
+                learned_at=props.get("learned_at"),
+                session_id=props.get("session_id"),
+                expired_at=props.get("expired_at"),
             )
         )
 
@@ -172,8 +187,106 @@ def hybrid_search(
     return search_results
 
 
+def diverse_search(
+    db: GrafeoDBProtocol,
+    embedder: EmbeddingClient,
+    query: str,
+    *,
+    user_id: str,
+    k: int = 10,
+    filters: dict | None = None,
+    vector_property: str = "embedding",
+    query_embedding: list[float] | None = None,
+    lambda_mult: float = 0.5,
+) -> list[SearchResult]:
+    """Search memories using MMR (Maximal Marginal Relevance) for diversity.
+
+    Balances relevance with diversity: lambda_mult=1.0 is pure relevance,
+    lambda_mult=0.0 is pure diversity. Default 0.5 is balanced.
+    Falls back to vector_search if mmr_search is not available.
+    """
+    if query_embedding is None:
+        query_embedding = embedder.embed([query])[0]
+
+    search_filters = {"user_id": user_id}
+    if filters:
+        search_filters.update(filters)
+
+    if not hasattr(db, "mmr_search"):
+        return vector_search(
+            db,
+            embedder,
+            query,
+            user_id=user_id,
+            k=k,
+            filters=filters,
+            vector_property=vector_property,
+            query_embedding=query_embedding,
+        )
+
+    try:
+        results = db.mmr_search(  # ty: ignore[call-non-callable]
+            MEMORY_LABEL,
+            vector_property,
+            query_embedding,
+            k,
+            fetch_k=k * 4,
+            lambda_mult=lambda_mult,
+            filters=search_filters,
+        )
+    except Exception:
+        logger.warning("mmr_search failed, falling back to vector_search", exc_info=True)
+        return vector_search(
+            db,
+            embedder,
+            query,
+            user_id=user_id,
+            k=k,
+            filters=filters,
+            vector_property=vector_property,
+            query_embedding=query_embedding,
+        )
+
+    search_results: list[SearchResult] = []
+    for node_id, distance in results:
+        node = db.get_node(node_id)
+        if node is None:
+            continue
+        props = _get_props(node)
+        if props.get("expired_at") is not None:
+            continue
+        # Post-hoc scope filtering
+        all_filters: dict = {"user_id": user_id}
+        if filters:
+            all_filters.update(filters)
+        if not _matches_filters(props, all_filters):
+            continue
+        relations = _get_node_relations(db, node_id)
+        similarity = max(0.0, 1.0 - float(distance))
+        search_results.append(
+            SearchResult(
+                memory_id=str(node_id),
+                text=props.get("text", ""),
+                score=similarity,
+                user_id=user_id,
+                metadata=_parse_metadata(props.get("metadata")),
+                relations=relations if relations else None,
+                actor_id=props.get("actor_id"),
+                role=props.get("role"),
+                memory_type=props.get("memory_type", "semantic"),
+                source="vector",
+                created_at=props.get("created_at"),
+                learned_at=props.get("learned_at"),
+                session_id=props.get("session_id"),
+                expired_at=props.get("expired_at"),
+            )
+        )
+
+    return search_results
+
+
 def search_similar(
-    db: object,
+    db: GrafeoDBProtocol,
     embeddings: list[list[float]],
     *,
     user_id: str,
@@ -262,7 +375,7 @@ def _matches_filters(props: dict, filters: dict) -> bool:
     return True
 
 
-def _get_node_relations(db: object, node_id: int) -> list[dict]:
+def _get_node_relations(db: GrafeoDBProtocol, node_id: int) -> list[dict]:
     """Get relations for a memory node by traversing HAS_ENTITY and RELATION edges."""
     from ..types import ENTITY_LABEL, HAS_ENTITY_EDGE, RELATION_EDGE
 
@@ -295,8 +408,8 @@ def _get_props(node: object) -> dict:
     if hasattr(node, "properties"):
         p = node.properties
         if callable(p):
-            return p()
-        return p
+            return p()  # ty: ignore[call-top-callable, invalid-return-type]
+        return p  # ty: ignore[invalid-return-type]
     return {}
 
 

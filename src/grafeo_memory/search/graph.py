@@ -9,7 +9,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from ..extraction import extract_entities
-from ..types import ENTITY_LABEL, HAS_ENTITY_EDGE, MEMORY_LABEL, Fact, SearchResult
+from ..types import ENTITY_LABEL, HAS_ENTITY_EDGE, MEMORY_LABEL, RELATION_EDGE, Fact, ModelType, SearchResult
 from .vector import _get_node_relations, _get_props
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from pydantic_ai.usage import RunUsage
 
     from ..embedding import EmbeddingClient
+    from ..protocol import GrafeoDBProtocol
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -31,8 +32,8 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def graph_search(
-    db: object,
-    model: object,
+    db: GrafeoDBProtocol,
+    model: ModelType,
     query: str,
     *,
     user_id: str,
@@ -42,6 +43,7 @@ def graph_search(
     _on_usage: Callable[[str, RunUsage], None] | None = None,
     _entities: list | None = None,
     query_embedding: list[float] | None = None,
+    search_depth: int = 1,
 ) -> list[SearchResult]:
     """Search by extracting entities from the query and finding linked memories.
 
@@ -121,6 +123,10 @@ def graph_search(
                     mem_node = db.get_node(int(vals[0]))
                     mem_props = _get_props(mem_node) if mem_node else {}
 
+                    # Skip expired memories (soft-deleted)
+                    if mem_props.get("expired_at") is not None:
+                        continue
+
                     # Compute score from embedding similarity if available
                     score = 0.3  # fallback: low score so vector results rank higher
                     if query_embedding is not None:
@@ -137,11 +143,66 @@ def graph_search(
                             relations=relations if relations else None,
                             memory_type=mem_props.get("memory_type", "semantic"),
                             source="graph",
+                            created_at=mem_props.get("created_at"),
+                            learned_at=mem_props.get("learned_at"),
+                            session_id=mem_props.get("session_id"),
+                            expired_at=mem_props.get("expired_at"),
                         )
                     )
             except Exception:
                 logger.warning("graph_search: traversal failed for entity_nid=%s", entity_nid, exc_info=True)
                 continue
+
+    # 2-hop traversal: Entity → RELATION → Entity → Memory (finds indirect connections)
+    if search_depth >= 2 and entities:
+        entity_names = [e.name for e in entities]
+        try:
+            two_hop_query = (
+                f"MATCH (e1:{ENTITY_LABEL})-[:{RELATION_EDGE}]->(e2:{ENTITY_LABEL})"
+                f"<-[:{HAS_ENTITY_EDGE}]-(m:{MEMORY_LABEL}) "
+                f"WHERE e1.name IN $names AND e1.user_id = $uid AND m.user_id = $uid "
+                f"RETURN DISTINCT id(m), m.text"
+            )
+            two_hop_result = db.execute(two_hop_query, {"names": entity_names, "uid": user_id})
+            for row in two_hop_result:
+                if not isinstance(row, dict):
+                    continue
+                vals = list(row.values())
+                if len(vals) < 2:
+                    continue
+                mem_id = str(vals[0])
+                if mem_id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(mem_id)
+                mem_node = db.get_node(int(vals[0]))
+                mem_props = _get_props(mem_node) if mem_node else {}
+                if mem_props.get("expired_at") is not None:
+                    continue
+                mem_text = str(vals[1]) if vals[1] else ""
+                # 2-hop results get a discount (0.7x) to prefer direct matches
+                score = 0.2
+                if query_embedding is not None:
+                    mem_embedding = mem_props.get(vector_property)
+                    if mem_embedding is not None and isinstance(mem_embedding, (list, tuple)):
+                        score = max(0.0, _cosine_similarity(query_embedding, mem_embedding) * 0.7)
+                relations = _get_node_relations(db, int(vals[0]))
+                results.append(
+                    SearchResult(
+                        memory_id=mem_id,
+                        text=mem_text,
+                        score=score,
+                        user_id=user_id,
+                        relations=relations if relations else None,
+                        memory_type=mem_props.get("memory_type", "semantic"),
+                        source="graph",
+                        created_at=mem_props.get("created_at"),
+                        learned_at=mem_props.get("learned_at"),
+                        session_id=mem_props.get("session_id"),
+                        expired_at=mem_props.get("expired_at"),
+                    )
+                )
+        except Exception:
+            logger.warning("graph_search: 2-hop traversal failed", exc_info=True)
 
     # Sort by score descending and limit to k results
     results.sort(key=lambda r: r.score, reverse=True)

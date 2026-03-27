@@ -6,6 +6,7 @@ import logging
 import math
 import time
 
+from .protocol import GrafeoDBProtocol
 from .types import ENTITY_LABEL, HAS_ENTITY_EDGE, MEMORY_LABEL, MemoryConfig, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def compute_composite_score(
 
 def apply_importance_scoring(
     results: list[SearchResult],
-    db: object,
+    db: GrafeoDBProtocol,
     config: MemoryConfig,
 ) -> list[SearchResult]:
     """Re-score results with composite importance scoring and update access stats.
@@ -124,9 +125,66 @@ def apply_importance_scoring(
     return scored
 
 
+def apply_cross_session_boost(
+    results: list[SearchResult],
+    db: GrafeoDBProtocol,
+    config: MemoryConfig,
+) -> list[SearchResult]:
+    """Boost scores using cached graph algorithm metrics (pagerank, betweenness).
+
+    Requires enable_graph_algorithms=True and _recompute_graph_metrics() to have run.
+    Uses pre-computed _pagerank and _betweenness node properties.
+    """
+    from .search.vector import _get_props
+
+    if not results or config.cross_session_factor <= 0:
+        return results
+
+    boosted: list[SearchResult] = []
+    for r in results:
+        try:
+            node_id = int(r.memory_id)
+        except ValueError:
+            boosted.append(r)
+            continue
+
+        node = db.get_node(node_id)
+        if node is None:
+            boosted.append(r)
+            continue
+
+        props = _get_props(node)
+        pr = float(props.get("_pagerank", 0.0))
+        bc = float(props.get("_betweenness", 0.0))
+        # Combine: pagerank captures global importance, betweenness captures bridging role
+        algo_score = 0.7 * min(1.0, pr * 10) + 0.3 * min(1.0, bc * 10)
+        boost = 1.0 + config.cross_session_factor * algo_score
+        boosted.append(
+            SearchResult(
+                memory_id=r.memory_id,
+                text=r.text,
+                score=r.score * boost,
+                user_id=r.user_id,
+                metadata=r.metadata,
+                relations=r.relations,
+                actor_id=r.actor_id,
+                role=r.role,
+                importance=r.importance,
+                access_count=r.access_count,
+                memory_type=r.memory_type,
+                source=r.source,
+                created_at=r.created_at,
+                expired_at=r.expired_at,
+            )
+        )
+
+    boosted.sort(key=lambda r: r.score, reverse=True)
+    return boosted
+
+
 def apply_topology_boost(
     results: list[SearchResult],
-    db: object,
+    db: GrafeoDBProtocol,
     config: MemoryConfig,
 ) -> list[SearchResult]:
     """Boost search result scores based on graph-topology connectivity.
@@ -185,7 +243,7 @@ def _topology_score(entity_count: int, shared_entity_ratio: float) -> float:
 
 
 def _compute_reinforcement(
-    db: object,
+    db: GrafeoDBProtocol,
     memory_id: int,
     created_at: int,
     gamma: float,
@@ -242,7 +300,7 @@ def _compute_reinforcement(
 
 
 def _batch_topology_scores(
-    db: object,
+    db: GrafeoDBProtocol,
     memory_ids: list[str],
     config: MemoryConfig,
 ) -> dict[str, tuple[float, float]]:

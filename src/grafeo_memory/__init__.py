@@ -6,9 +6,18 @@ from .embedding import EmbeddingClient, MistralEmbedder, OpenAIEmbedder
 from .history import HistoryEntry
 from .manager import AsyncMemoryManager, MemoryManager
 from .messages import ImageContent, Message
+from .protocol import GrafeoDBProtocol, GrafeoNode
 from .reranker import LLMReranker, Reranker
-from .scoring import apply_importance_scoring, apply_topology_boost, compute_composite_score
+from .scoring import (
+    apply_cross_session_boost,
+    apply_importance_scoring,
+    apply_topology_boost,
+    compute_composite_score,
+)
+from .temporal import TemporalHints, detect_temporal_hints
 from .types import (
+    LEADS_TO_EDGE,
+    SUPERSEDES_EDGE,
     AddResult,
     EntitiesOutput,
     Entity,
@@ -30,6 +39,8 @@ from .types import (
 )
 
 __all__ = [
+    "LEADS_TO_EDGE",
+    "SUPERSEDES_EDGE",
     "AddResult",
     "AsyncMemoryManager",
     "EmbeddingClient",
@@ -40,6 +51,8 @@ __all__ = [
     "ExtractionResult",
     "Fact",
     "FactsOutput",
+    "GrafeoDBProtocol",
+    "GrafeoNode",
     "HistoryEntry",
     "ImageContent",
     "InstrumentationSettings",
@@ -59,9 +72,12 @@ __all__ = [
     "Reranker",
     "SearchResponse",
     "SearchResult",
+    "TemporalHints",
+    "apply_cross_session_boost",
     "apply_importance_scoring",
     "apply_topology_boost",
     "compute_composite_score",
+    "detect_temporal_hints",
 ]
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"

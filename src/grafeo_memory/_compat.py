@@ -22,9 +22,9 @@ if sys.platform == "win32":
 
         def _safe_del(self, _warn: object = None) -> None:
             with contextlib.suppress(RuntimeError):
-                _original_del(self, _warn)  # type: ignore[too-many-positional-arguments]
+                _original_del(self, _warn)  # ty: ignore[too-many-positional-arguments]
 
-        _ProactorBasePipeTransport.__del__ = _safe_del  # type: ignore[assignment]
+        _ProactorBasePipeTransport.__del__ = _safe_del  # ty: ignore[invalid-assignment]
     except (ImportError, AttributeError):
         pass
 

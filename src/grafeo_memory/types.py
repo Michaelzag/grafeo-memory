@@ -9,6 +9,7 @@ from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pydantic_ai.models import KnownModelName, Model
     from pydantic_ai.models.instrumented import InstrumentationSettings
     from pydantic_ai.usage import RunUsage
 
@@ -23,6 +24,9 @@ from .schemas import (
     RelationItem,
     RelationReconciliationOutput,
 )
+
+#: Model parameter type accepted by pydantic-ai Agent.
+type ModelType = Model | KnownModelName | str | None
 
 
 class MemoryAction(Enum):
@@ -83,7 +87,15 @@ class MemoryConfig:
     instrument: InstrumentationSettings | bool = False
     # Vision / multimodal (opt-in)
     enable_vision: bool = False
-    vision_model: object | None = None
+    vision_model: ModelType | None = None
+    # Multi-hop graph search depth (1 = current behavior, 2 = entity→relation→entity→memory)
+    graph_search_depth: int = 1
+    # MMR search for diversity (opt-in, uses engine's mmr_search)
+    mmr_lambda: float = 0.5
+    # Cross-session entity reinforcement boost factor
+    cross_session_factor: float = 0.0
+    # Graph algorithm-based scoring (opt-in, replaces hand-coded topology)
+    enable_graph_algorithms: bool = False
 
     def __post_init__(self) -> None:
         if self.embedding_dimensions <= 0:
@@ -95,6 +107,9 @@ class MemoryConfig:
         if self.decay_rate <= 0:
             raise ValueError(f"decay_rate must be positive, got {self.decay_rate}")
 
+        if self.graph_search_depth not in (1, 2):
+            raise ValueError(f"graph_search_depth must be 1 or 2, got {self.graph_search_depth}")
+
         for name in (
             "weight_similarity",
             "weight_recency",
@@ -105,6 +120,8 @@ class MemoryConfig:
             "structural_feedback_gamma",
             "consolidation_protect_threshold",
             "agreement_bonus",
+            "mmr_lambda",
+            "cross_session_factor",
         ):
             val = getattr(self, name)
             if not (0.0 <= val <= 1.0):
@@ -174,6 +191,10 @@ class SearchResult:
     access_count: int | None = None
     memory_type: str | None = None
     source: str | None = None
+    created_at: int | None = None
+    learned_at: int | None = None
+    session_id: str | None = None
+    expired_at: int | None = None
 
 
 @dataclass
@@ -254,6 +275,8 @@ ENTITY_LABEL = "Entity"
 HAS_ENTITY_EDGE = "HAS_ENTITY"
 RELATION_EDGE = "RELATION"
 DERIVED_FROM_EDGE = "DERIVED_FROM"
+SUPERSEDES_EDGE = "SUPERSEDES"
+LEADS_TO_EDGE = "LEADS_TO"
 
 
 class AddResult(list):
@@ -280,8 +303,10 @@ __all__ = [
     "DERIVED_FROM_EDGE",
     "ENTITY_LABEL",
     "HAS_ENTITY_EDGE",
+    "LEADS_TO_EDGE",
     "MEMORY_LABEL",
     "RELATION_EDGE",
+    "SUPERSEDES_EDGE",
     "AddResult",
     "EntitiesOutput",
     "Entity",
