@@ -641,7 +641,7 @@ class _MemoryCore:
             elif v:
                 seen[mid] = v
             else:
-                seen[mid] = g  # type: ignore[assignment]
+                seen[mid] = g  # ty: ignore[invalid-assignment]
 
         final = sorted(seen.values(), key=lambda r: r.score, reverse=True)
 
@@ -897,6 +897,9 @@ class _MemoryCore:
                         decision.target_memory_id,
                         exc_info=True,
                     )
+                # Inherit entity edges from the expired memory so graph search
+                # can still reach the new memory via the old entity connections.
+                self._inherit_entity_edges(decision.target_memory_id, new_memory_id)
                 record_history(
                     self._db,
                     int(new_memory_id),
@@ -1060,6 +1063,35 @@ class _MemoryCore:
 
         self._db.set_node_property(node_id, "expired_at", timestamp)
         return old_text
+
+    def _inherit_entity_edges(self, old_memory_id: str, new_memory_id: str) -> None:
+        """Copy HAS_ENTITY edges from an expired memory to its replacement.
+
+        When UPDATE expires a memory and creates a new one, the old memory's
+        entity connections would be lost to graph search. This preserves them
+        so the new memory is reachable via all the same entity paths.
+        """
+        try:
+            old_id = int(old_memory_id)
+            new_id = int(new_memory_id)
+        except ValueError:
+            return
+
+        try:
+            query = (
+                f"MATCH (m:{MEMORY_LABEL})-[:{HAS_ENTITY_EDGE}]->(e:{ENTITY_LABEL}) WHERE id(m) = $old_id RETURN id(e)"
+            )
+            rows = self._db.execute(query, {"old_id": old_id})
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                vals = list(row.values())
+                if vals:
+                    entity_id = int(vals[0])
+                    with contextlib.suppress(Exception):
+                        self._db.create_edge(new_id, entity_id, HAS_ENTITY_EDGE)
+        except Exception:
+            logger.debug("_inherit_entity_edges failed for %s->%s", old_memory_id, new_memory_id, exc_info=True)
 
     def _link_session_chain(self, new_memory_ids: list[str], user_id: str, run_id: str) -> None:
         """Create LEADS_TO edges linking new memories to the session's previous memory."""

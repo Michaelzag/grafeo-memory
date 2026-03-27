@@ -367,3 +367,48 @@ class TestBatchRawAdd:
             props = props()
         assert "learned_at" in props
         manager.close()
+
+
+# ---------------------------------------------------------------------------
+# Entity edge inheritance on UPDATE (SUPERSEDES)
+# ---------------------------------------------------------------------------
+
+
+class TestEntityInheritance:
+    def test_inherit_entity_edges_direct(self):
+        """Direct test: _inherit_entity_edges copies HAS_ENTITY edges."""
+        manager = _make_manager(
+            [
+                _extraction(
+                    ["alice works at acme"],
+                    [
+                        {"name": "alice", "entity_type": "person"},
+                        {"name": "acme", "entity_type": "org"},
+                    ],
+                    [{"source": "alice", "target": "acme", "relation_type": "works_at"}],
+                ),
+            ]
+        )
+
+        events = manager.add("Alice works at Acme")
+        old_id = events[0].memory_id
+
+        # Create a new bare memory node (simulating the UPDATE replacement)
+        new_node = manager._db.create_node(["Memory"], {"text": "alice now at globex", "user_id": "test_user"})
+        new_id = str(new_node.id if hasattr(new_node, "id") else new_node)
+
+        # Before inheritance: new node has no entity edges
+        query = "MATCH (m:Memory)-[:HAS_ENTITY]->(e:Entity) WHERE id(m) = $mid RETURN id(e)"
+        before = manager._db.execute(query, {"mid": int(new_id)})
+        assert len(list(before)) == 0
+
+        # Inherit edges from old memory
+        manager._inherit_entity_edges(old_id, new_id)
+
+        # After inheritance: new node should have the same entity edges as the old one
+        after = list(manager._db.execute(query, {"mid": int(new_id)}))
+        old_entities = list(manager._db.execute(query, {"mid": int(old_id)}))
+
+        assert len(after) > 0, "New memory should have inherited entity edges"
+        assert len(after) == len(old_entities), "Should have same number of entity edges"
+        manager.close()
