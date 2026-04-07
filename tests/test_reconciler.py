@@ -137,3 +137,56 @@ def test_reconcile_relations_error():
     existing = [{"source": "alice", "target": "acme", "relation_type": "works_at", "edge_id": 5}]
     to_delete = reconcile_relations(model, new_rels, existing)
     assert to_delete == []
+
+
+# --- T6: Reconciliation boundary (threshold behavior) ---
+
+
+class TestReconciliationBoundary:
+    """T6: verify that similar memories trigger UPDATE when above threshold."""
+
+    def test_similar_fact_triggers_update(self):
+        """When existing memory is found above threshold, reconciler should produce UPDATE."""
+        model = make_test_model(
+            [
+                {
+                    "decisions": [
+                        {"action": "UPDATE", "target_memory_id": "42", "text": "alice works from home now"},
+                    ]
+                },
+            ]
+        )
+        facts = [Fact("alice works from home now")]
+        existing = [{"id": "42", "text": "alice loves remote work", "score": 0.85}]
+        decisions = reconcile(model, facts, existing)
+        assert len(decisions) == 1
+        assert decisions[0].action == MemoryAction.UPDATE
+        assert decisions[0].target_memory_id == "42"
+        assert "home" in decisions[0].text
+
+    def test_no_existing_always_adds(self):
+        """With no existing memories above threshold, all facts become ADDs."""
+        model = make_test_model([])
+        facts = [Fact("alice works from home")]
+        decisions = reconcile(model, facts, [])
+        assert len(decisions) == 1
+        assert decisions[0].action == MemoryAction.ADD
+
+    def test_mixed_add_and_update(self):
+        """Some facts update existing memories, others are new ADDs."""
+        model = make_test_model(
+            [
+                {
+                    "decisions": [
+                        {"action": "UPDATE", "target_memory_id": "10", "text": "alice works from home"},
+                        {"action": "ADD", "text": "alice has a cat named whiskers"},
+                    ]
+                },
+            ]
+        )
+        facts = [Fact("alice works from home"), Fact("alice has a cat named whiskers")]
+        existing = [{"id": "10", "text": "alice works at acme office", "score": 0.7}]
+        decisions = reconcile(model, facts, existing)
+        assert len(decisions) == 2
+        assert decisions[0].action == MemoryAction.UPDATE
+        assert decisions[1].action == MemoryAction.ADD

@@ -145,6 +145,18 @@ MemoryManager("google-gla:gemini-2.0-flash", config, embedder=embedder)
 
 Both accept an optional `model` parameter to override the default.
 
+### Which model works best?
+
+| Provider | Combined extraction | Individual extraction | Notes |
+| --- | --- | --- | --- |
+| OpenAI (gpt-4o-mini) | Works | Works | Recommended default |
+| Anthropic (claude-sonnet) | Works | Works | Untested in CI |
+| Mistral (mistral-small) | Falls back | Works | 3 API calls instead of 1 |
+| Groq | Unknown | Unknown | Needs testing |
+| Google | Unknown | Unknown | Needs testing |
+
+grafeo-memory tries a single "combined" LLM call first (facts + entities + relations in one schema). If the model cannot handle the combined schema, it falls back to separate calls automatically. Mistral models typically trigger this fallback, which means 3 API calls per `add()` instead of 1. The fallback is silent (logged at DEBUG level, no traceback printed).
+
 ## Custom Embeddings
 
 Implement the `EmbeddingClient` protocol to use any embedding provider:
@@ -268,7 +280,7 @@ config = MemoryConfig(instrument=InstrumentationSettings(
 - `.delete(memory_id)` → `bool`
 - `.delete_all(user_id=None)` → `int` (count deleted)
 - `.summarize(user_id=None, *, preserve_recent=5, batch_size=20)` → `AddResult`
-- `.history(memory_id)` → `list[HistoryEntry]`
+- `.history(memory_id)` → `list[HistoryEntry]`: returns change history sorted by timestamp (oldest first)
 - `.set_importance(memory_id, importance)` → `bool`
 - `.close()`: close the database
 
@@ -280,7 +292,7 @@ Use as a context manager: `with MemoryManager(...) as memory:`. Multiple session
 - `user_id`: default user scope (default `"default"`)
 - `session_id`: default session scope
 - `agent_id`: default agent scope
-- `reconciliation_threshold`: minimum similarity for reconciliation candidates (default 0.3)
+- `reconciliation_threshold`: minimum cosine similarity (0.0 to 1.0) for a memory to be considered a reconciliation candidate during `add()`. Lower values find more candidates, higher values require closer matches. At 0.3 (default), loosely related memories are considered. At 0.7+, only very similar memories trigger UPDATE/DELETE decisions
 - `search_min_score`: minimum score for search results, 0.0 returns everything (default 0.0)
 - `agreement_bonus`: score boost when both vector and graph find the same memory (default 0.1)
 - `embedding_dimensions`: vector dimensions (default 1536)
@@ -302,7 +314,7 @@ Use as a context manager: `with MemoryManager(...) as memory:`. Multiple session
 - **`SearchResponse`**: list subclass of `SearchResult`, with `.usage` for LLM token counts
 - **`MemoryEvent`**: `.action` (ADD/UPDATE/DELETE/NONE), `.memory_id`, `.text`, `.old_text`
 - **`SearchResult`**: `.memory_id`, `.text`, `.score`, `.user_id`, `.metadata`, `.relations`, `.memory_type`
-- **`HistoryEntry`**: `.event`, `.old_text`, `.new_text`, `.timestamp`, `.actor_id`, `.role`
+- **`HistoryEntry`**: `.event` (ADD/UPDATE/DELETE), `.old_text`, `.new_text`, `.timestamp` (epoch ms), `.actor_id`, `.role`. Returned sorted by timestamp ascending (oldest first)
 
 ### Iteration
 

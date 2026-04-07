@@ -111,3 +111,35 @@ def test_full_extract_fallback_to_separate_calls():
     assert result.facts[0].text == "alice works at acme"
     assert len(result.entities) == 1
     assert result.entities[0].name == "alice"
+
+
+def test_mistral_fallback_no_stderr_traceback(capsys):
+    """T10: combined extraction failure should not print tracebacks to stderr.
+
+    Mistral (and other providers) may fail on the combined extraction schema.
+    The fallback to separate calls should work silently without noisy output.
+    """
+    from mock_llm import make_error_then_succeed_model
+
+    model = make_error_then_succeed_model(
+        [
+            # Call 1 (index 0) errors (combined extraction)
+            # Call 2 (index 1) -> fact extraction
+            {"facts": ["bob likes swimming"]},
+            # Call 3 (index 2) -> entity extraction
+            {
+                "entities": [{"name": "bob", "entity_type": "person"}],
+                "relations": [],
+            },
+        ]
+    )
+    result = extract(model, "Bob likes swimming", "bob")
+
+    # Verify fallback succeeded
+    assert len(result.facts) == 1
+    assert result.facts[0].text == "bob likes swimming"
+
+    # Verify no traceback was printed to stderr
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Error" not in captured.err

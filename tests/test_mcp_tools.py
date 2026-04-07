@@ -241,3 +241,65 @@ class TestErrorHandling:
         result = json.loads(asyncio.run(memory_search("test", ctx=ctx)))
         assert "error" in result
         assert "DB connection failed" in result["error"]
+
+
+class TestMCPSmokeAllTools:
+    """T16: import all MCP tool functions and call each with mock context. No crashes."""
+
+    def test_all_tools_importable(self):
+        """All MCP tool functions should import without errors."""
+        from grafeo_memory.mcp.tools import (
+            memory_add,
+            memory_add_batch,
+            memory_delete,
+            memory_delete_all,
+            memory_history,
+            memory_list,
+            memory_search,
+            memory_summarize,
+            memory_update,
+        )
+
+        assert callable(memory_add)
+        assert callable(memory_add_batch)
+        assert callable(memory_search)
+        assert callable(memory_update)
+        assert callable(memory_delete)
+        assert callable(memory_delete_all)
+        assert callable(memory_list)
+        assert callable(memory_summarize)
+        assert callable(memory_history)
+
+    def test_all_tools_callable_with_mock(self):
+        """Call every MCP tool with mock context and verify JSON responses."""
+        from grafeo_memory.mcp.tools import (
+            memory_add,
+            memory_add_batch,
+            memory_delete,
+            memory_delete_all,
+            memory_history,
+            memory_list,
+            memory_search,
+            memory_summarize,
+            memory_update,
+        )
+
+        ctx, _ = _make_ctx()
+
+        # Each tool should return valid JSON without crashing
+        tools_and_args = [
+            (memory_add, ("test text",), {"ctx": ctx}),
+            (memory_add_batch, (["text1", "text2"],), {"ctx": ctx}),
+            (memory_search, ("query",), {"ctx": ctx}),
+            (memory_update, ("1", "new text"), {"ctx": ctx}),
+            (memory_delete, ("1",), {"ctx": ctx}),
+            (memory_delete_all, (), {"ctx": ctx}),
+            (memory_list, (), {"ctx": ctx}),
+            (memory_summarize, (), {"ctx": ctx}),
+            (memory_history, ("1",), {"ctx": ctx}),
+        ]
+
+        for tool_fn, args, kwargs in tools_and_args:
+            result_str = asyncio.run(tool_fn(*args, **kwargs))
+            result = json.loads(result_str)
+            assert isinstance(result, dict), f"{tool_fn.__name__} did not return a dict"

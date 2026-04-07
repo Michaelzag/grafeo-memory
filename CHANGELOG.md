@@ -5,6 +5,33 @@ All notable changes to grafeo-memory are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-07
+
+Test quality, error surfacing and documentation improvements.
+
+### Added
+
+- **Error surfacing tests**: broken embedder on add/search now verified to raise, not silently return empty results
+- **Persistence lifecycle tests**: write, close, reopen round-trip with `tmp_path`
+- **Multi-session regression tests**: sequential open/close/open guards against event loop corruption
+- **Concurrency tests**: concurrent async adds for same user (lock verification) and different users (isolation)
+- **Reconciliation boundary test**: controlled embeddings at threshold boundary verify UPDATE triggers
+- **History ordering test**: LEADS_TO chain verified for session-order retrieval
+- **Delete cascade test**: orphaned entity behavior after memory deletion documented
+- **Memory type filter test**: search with `memory_type` filter verified
+- **Summarize test**: non-empty summary from related memories
+- **MCP tool smoke tests**: all tool functions imported and called with mock context
+
+### Changed
+
+- `test_search_with_broken_embedder` now uses `pytest.raises` instead of silently passing
+- Concurrency tests use `async with` context manager for guaranteed cleanup
+- Error surfacing tests wrapped in `try/finally` for manager cleanup
+- Shared `make_manager` helper extracted to `conftest.py`
+- README: added model compatibility table (OpenAI, Anthropic, Mistral, Groq, Google)
+- README: documented reconciliation threshold tuning and `history()` return type
+- 435 tests passing
+
 ## [0.2.0] - 2026-03-26
 
 Temporal reasoning, multi-hop search and engine integration for better long running memory performance.

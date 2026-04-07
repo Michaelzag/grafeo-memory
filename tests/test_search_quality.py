@@ -204,6 +204,52 @@ class TestConcurrentAddLocking:
         assert mgr._user_locks["user_a"] is not mgr._user_locks["user_b"]
 
 
+class TestSearchMemoryTypeFilter:
+    """T13: search with memory_type filter should return only matching type."""
+
+    def test_search_semantic_only(self):
+        """search(memory_type='semantic') should exclude procedural memories."""
+        mgr = _make_manager(
+            [{"entities": [], "relations": []}],
+        )
+        mgr.add("alice works at acme", infer=False)
+        mgr.add("always use type hints", infer=False, memory_type="procedural")
+        mgr.add("prefer pytest over unittest", infer=False, memory_type="procedural")
+        mgr._ensure_indexes()
+
+        results = mgr.search("anything", memory_type="semantic")
+        assert len(results) == 1
+        assert all(r.memory_type == "semantic" for r in results)
+
+    def test_search_procedural_only(self):
+        """search(memory_type='procedural') should exclude semantic memories."""
+        mgr = _make_manager(
+            [{"entities": [], "relations": []}],
+        )
+        mgr.add("alice works at acme", infer=False)
+        mgr.add("always use type hints", infer=False, memory_type="procedural")
+        mgr.add("prefer pytest over unittest", infer=False, memory_type="procedural")
+        mgr._ensure_indexes()
+
+        results = mgr.search("anything", memory_type="procedural")
+        assert len(results) == 2
+        assert all(r.memory_type == "procedural" for r in results)
+
+    def test_search_no_filter_returns_all(self):
+        """search() without memory_type should return all types."""
+        mgr = _make_manager(
+            [{"entities": [], "relations": []}],
+        )
+        mgr.add("alice works at acme", infer=False)
+        mgr.add("always use type hints", infer=False, memory_type="procedural")
+        mgr._ensure_indexes()
+
+        results = mgr.search("anything")
+        assert len(results) == 2
+        types = {r.memory_type for r in results}
+        assert types == {"semantic", "procedural"}
+
+
 class TestExplainMinScoreStep:
     """Test that explain() includes min_score_filter step when active."""
 
