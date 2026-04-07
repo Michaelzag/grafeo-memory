@@ -1632,3 +1632,166 @@ class TestEpisodicMemory:
         assert MemoryType.SEMANTIC == "semantic"
         assert MemoryType.PROCEDURAL == "procedural"
         assert MemoryType("episodic") == MemoryType.EPISODIC
+
+
+# --- T11: History ordering ---
+
+
+class TestHistoryOrdering:
+    """T11: history() should return entries in insertion order via temporal chain."""
+
+    def test_history_ordered_by_timestamp(self):
+        """Add 5 memories in sequence, history() for each should reflect order."""
+        manager = _make_manager(
+            [
+                {"facts": ["alice works at acme"], "entities": [], "relations": []},
+            ]
+        )
+        events = manager.add("Alice works at Acme Corp")
+        memory_id = events[0].memory_id
+
+        # Update the same memory multiple times
+        import time
+
+        for new_text in ["alice works at beta", "alice works at gamma", "alice works at delta"]:
+            time.sleep(0.002)
+            manager.update(memory_id, new_text)
+
+        history = manager.history(memory_id)
+        # Should have ADD + 3 UPDATEs = 4 entries
+        assert len(history) >= 4
+        # Timestamps should be non-decreasing
+        for i in range(1, len(history)):
+            assert history[i].timestamp >= history[i - 1].timestamp
+        # First entry should be ADD
+        assert history[0].event == "ADD"
+        manager.close()
+
+    def test_history_preserves_old_and_new_text(self):
+        """History entries should record old_text and new_text for UPDATEs."""
+        manager = _make_manager(
+            [
+                {"facts": ["fact v1"], "entities": [], "relations": []},
+            ]
+        )
+        events = manager.add("fact v1")
+        memory_id = events[0].memory_id
+        manager.update(memory_id, "fact v2")
+        manager.update(memory_id, "fact v3")
+
+        history = manager.history(memory_id)
+        updates = [h for h in history if h.event == "UPDATE"]
+        assert len(updates) == 2
+        assert updates[0].old_text == "fact v1"
+        assert updates[0].new_text == "fact v2"
+        assert updates[1].old_text == "fact v2"
+        assert updates[1].new_text == "fact v3"
+        manager.close()
+
+
+# --- T12: Delete cascade ---
+
+
+class TestDeleteCascade:
+    """T12: deleting a memory should handle orphaned entities."""
+
+    def test_delete_memory_with_entities(self):
+        """After deleting a memory that has entities, the delete should succeed."""
+        manager = _make_manager(
+            [
+                {
+                    "facts": ["alice works at acme corp"],
+                    "entities": [
+                        {"name": "alice", "entity_type": "person"},
+                        {"name": "acme_corp", "entity_type": "organization"},
+                    ],
+                    "relations": [
+                        {"source": "alice", "target": "acme_corp", "relation_type": "works_at"},
+                    ],
+                },
+            ]
+        )
+        events = manager.add("Alice works at Acme Corp")
+        memory_id = events[0].memory_id
+
+        # Verify entities exist before delete
+        result = manager._db.execute(
+            "MATCH (m:Memory)-[:HAS_ENTITY]->(e:Entity) WHERE id(m) = $mid RETURN e.name",
+            {"mid": int(memory_id)},
+        )
+        entity_names = [next(iter(row.values())) for row in result if isinstance(row, dict)]
+        assert len(entity_names) >= 1
+
+        # Delete the memory
+        deleted = manager.delete(memory_id)
+        assert deleted is True
+
+        # Memory node should be gone
+        assert manager.delete(memory_id) is False
+        manager.close()
+
+    def test_delete_does_not_crash_with_shared_entities(self):
+        """Deleting one memory should not break another memory sharing the same entity."""
+        manager = _make_manager(
+            [
+                {
+                    "facts": ["alice likes hiking"],
+                    "entities": [{"name": "alice", "entity_type": "person"}],
+                    "relations": [],
+                },
+                {
+                    "facts": ["alice likes cooking"],
+                    "entities": [{"name": "alice", "entity_type": "person"}],
+                    "relations": [],
+                },
+            ]
+        )
+        events1 = manager.add("Alice likes hiking")
+        manager.add("Alice likes cooking")
+
+        # Delete first memory
+        manager.delete(events1[0].memory_id)
+
+        # Second memory should still be accessible
+        memories = manager.get_all()
+        assert len(memories) == 1
+        assert "cooking" in memories[0].text
+        manager.close()
+
+
+# --- T14: Summarize produces non-empty summary ---
+
+
+class TestSummarizeContent:
+    """T14: add 5 related memories, call summarize(), verify non-empty summary."""
+
+    def test_summarize_produces_nonempty_summary(self):
+        """summarize() should produce at least one non-empty consolidated memory."""
+        manager = _make_manager(
+            [
+                {"memories": ["alice is a python developer at acme who likes hiking and has a dog"]},
+            ]
+        )
+        import time
+
+        for text in [
+            "alice works at acme corp",
+            "alice is a python developer",
+            "alice likes hiking",
+            "alice has a dog named max",
+            "alice prefers dark mode",
+            "alice lives in san francisco",
+            "alice drinks coffee",
+        ]:
+            manager.add(text, infer=False)
+            time.sleep(0.002)
+
+        events = manager.summarize(preserve_recent=2, batch_size=20)
+
+        adds = [e for e in events if e.action == MemoryAction.ADD]
+        assert len(adds) >= 1
+        # The consolidated text should be non-empty
+        for add_event in adds:
+            assert add_event.text
+            assert len(add_event.text) > 0
+        manager.close()
