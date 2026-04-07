@@ -6,9 +6,9 @@ from pathlib import Path
 # Add tests directory to sys.path so mock_llm can be imported
 sys.path.insert(0, str(Path(__file__).parent))
 
-from mock_llm import MockEmbedder, make_test_model  # noqa: E402
+from mock_llm import MockEmbedder, make_test_model
 
-from grafeo_memory import MemoryConfig, MemoryManager  # noqa: E402
+from grafeo_memory import MemoryConfig, MemoryManager
 
 
 def make_manager(outputs, db_path=None, dims=16, **config_kwargs):
